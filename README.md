@@ -76,18 +76,34 @@ session = Session.Builder() \
     .create()
 ```
 
-#### With auth url callback
+#### With auth url callback and changing the content of the success page
 
 ```python
 from librespot.core import Session
+import webbrowser
 
 # This will pass the auth url to the method
 
 def auth_url_callback(url):
-    print(url)
+    webbrowser.open(url)
+
+# This is the response sent to the browser once the flow has been completed successfully
+success_page = "<html><body><h1>Login Successful</h1><p>You can close this window now.</p><script>setTimeout(() => {window.close()}, 100);</script></body></html>"
 
 session = Session.Builder() \
-    .oauth(auth_url_callback) \
+    .oauth(auth_url_callback, success_page) \
+    .create()
+```
+
+### Use Stored Credentials for Login
+
+```python
+from librespot.core import Session
+
+# Supports both Python and Rust librespot credential formats
+
+session = Session.Builder() \
+    .stored_file("/path/to/credentials.json") \
     .create()
 ```
 

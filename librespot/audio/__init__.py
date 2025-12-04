@@ -8,6 +8,7 @@ from librespot.crypto import Packet
 from librespot.metadata import EpisodeId, PlayableId, TrackId
 from librespot.proto import Metadata_pb2 as Metadata, StorageResolve_pb2 as StorageResolve
 from librespot.structure import AudioDecrypt, AudioQualityPicker, Closeable, FeederException, GeneralAudioStream, GeneralWritableStream, HaltListener, NoopAudioDecrypt, PacketsReceiver
+from requests.structures import CaseInsensitiveDict
 import concurrent.futures
 import io
 import logging
@@ -330,7 +331,7 @@ class CdnFeedHelper:
             session: Session, track: Metadata.Track, file: Metadata.AudioFile,
             resp_or_url: typing.Union[StorageResolve.StorageResolveResponse,
                                       str], preload: bool,
-            halt_listener: HaltListener) -> PlayableContentFeeder.LoadedStream:
+            halt_listener: HaltListener) -> LoadedStream:
         if type(resp_or_url) is str:
             url = resp_or_url
         else:
@@ -344,18 +345,17 @@ class CdnFeedHelper:
         normalization_data = NormalizationData.read(input_stream)
         if input_stream.skip(0xA7) != 0xA7:
             raise IOError("Couldn't skip 0xa7 bytes!")
-        return PlayableContentFeeder.LoadedStream(
+        return LoadedStream(
             track,
             streamer,
             normalization_data,
-            PlayableContentFeeder.Metrics(file.file_id, preload,
-                                          -1 if preload else audio_key_time),
+            file.file_id, preload, audio_key_time
         )
 
     @staticmethod
     def load_episode_external(
             session: Session, episode: Metadata.Episode,
-            halt_listener: HaltListener) -> PlayableContentFeeder.LoadedStream:
+            halt_listener: HaltListener) -> LoadedStream:
         resp = session.client().head(episode.external_url)
 
         if resp.status_code != 200:
@@ -367,11 +367,11 @@ class CdnFeedHelper:
 
         streamer = session.cdn().stream_external_episode(
             episode, url, halt_listener)
-        return PlayableContentFeeder.LoadedStream(
+        return LoadedStream(
             episode,
             streamer,
             None,
-            PlayableContentFeeder.Metrics(None, False, -1),
+            None, False, -1
         )
 
     @staticmethod
@@ -382,7 +382,7 @@ class CdnFeedHelper:
         resp_or_url: typing.Union[StorageResolve.StorageResolveResponse, str],
         preload: bool,
         halt_listener: HaltListener,
-    ) -> PlayableContentFeeder.LoadedStream:
+    ) -> LoadedStream:
         if type(resp_or_url) is str:
             url = resp_or_url
         else:
@@ -396,12 +396,11 @@ class CdnFeedHelper:
         normalization_data = NormalizationData.read(input_stream)
         if input_stream.skip(0xA7) != 0xA7:
             raise IOError("Couldn't skip 0xa7 bytes!")
-        return PlayableContentFeeder.LoadedStream(
+        return LoadedStream(
             episode,
             streamer,
             normalization_data,
-            PlayableContentFeeder.Metrics(file.file_id, preload,
-                                          -1 if preload else audio_key_time),
+            file.file_id, preload, audio_key_time
         )
 
 
@@ -471,9 +470,9 @@ class CdnManager:
 
     class InternalResponse:
         buffer: bytes
-        headers: typing.Dict[str, str]
+        headers: CaseInsensitiveDict[str, str]
 
-        def __init__(self, buffer: bytes, headers: typing.Dict[str, str]):
+        def __init__(self, buffer: bytes, headers: CaseInsensitiveDict[str, str]):
             self.buffer = buffer
             self.headers = headers
 
@@ -579,8 +578,6 @@ class CdnManager:
                                     range_end=ChannelManager.chunk_size - 1)
             content_range = response.headers.get("Content-Range")
             if content_range is None:
-                content_range = response.headers.get("content-range")
-            if content_range is None:
                 raise IOError("Missing Content-Range header!")
             split = content_range.split("/")
             self.size = int(split[1])
@@ -633,16 +630,16 @@ class CdnManager:
                 range_end = (chunk + 1) * ChannelManager.chunk_size - 1
             response = self.__session.client().get(
                 self.__cdn_url.url,
-                headers={
+                headers=CaseInsensitiveDict({
                     "Range": "bytes={}-{}".format(range_start, range_end)
-                },
+                }),
             )
             if response.status_code != 206:
                 raise IOError(response.status_code)
             body = response.content
             if body is None:
                 raise IOError("Response body is empty!")
-            return CdnManager.InternalResponse(body, dict(response.headers))
+            return CdnManager.InternalResponse(body, response.headers)
 
         class InternalStream(AbsChunkedInputStream):
             streamer: CdnManager.Streamer
@@ -749,7 +746,9 @@ class PlayableContentFeeder:
                     episode: Metadata.Episode, preload: bool,
                     halt_lister: HaltListener):
         if track is None and episode is None:
-            raise RuntimeError()
+            raise RuntimeError("No content passed!")
+        elif file is None:
+            raise RuntimeError("Content has no audio file!")
         response = self.resolve_storage_interactive(file.file_id, preload)
         if response.result == StorageResolve.StorageResolveResponse.Result.CDN:
             if track is not None:
@@ -779,6 +778,7 @@ class PlayableContentFeeder:
             self.logger.fatal(
                 "Couldn't find any suitable audio file, available: {}".format(
                     episode.audio))
+            raise FeederException("Cannot find suitable audio file")
         return self.load_stream(file, None, episode, preload, halt_listener)
 
     def load_track(self, track_id_or_track: typing.Union[TrackId,
@@ -798,7 +798,7 @@ class PlayableContentFeeder:
             self.logger.fatal(
                 "Couldn't find any suitable audio file, available: {}".format(
                     track.file))
-            raise FeederException()
+            raise FeederException("Cannot find suitable audio file")
         return self.load_stream(file, track, None, preload, halt_listener)
 
     def pick_alternative_if_necessary(
@@ -849,29 +849,13 @@ class PlayableContentFeeder:
         storage_resolve_response.ParseFromString(body)
         return storage_resolve_response
 
-    class LoadedStream:
-        episode: Metadata.Episode
-        track: Metadata.Track
-        input_stream: GeneralAudioStream
-        normalization_data: NormalizationData
-        metrics: PlayableContentFeeder.Metrics
 
-        def __init__(self, track_or_episode: typing.Union[Metadata.Track,
-                                                          Metadata.Episode],
-                     input_stream: GeneralAudioStream,
-                     normalization_data: typing.Union[NormalizationData, None],
-                     metrics: PlayableContentFeeder.Metrics):
-            if type(track_or_episode) is Metadata.Track:
-                self.track = track_or_episode
-                self.episode = None
-            elif type(track_or_episode) is Metadata.Episode:
-                self.track = None
-                self.episode = track_or_episode
-            else:
-                raise TypeError()
-            self.input_stream = input_stream
-            self.normalization_data = normalization_data
-            self.metrics = metrics
+class LoadedStream:
+    episode: Metadata.Episode
+    track: Metadata.Track
+    input_stream: GeneralAudioStream
+    normalization_data: NormalizationData
+    metrics: Metrics
 
     class Metrics:
         file_id: str
@@ -879,13 +863,27 @@ class PlayableContentFeeder:
         audio_key_time: int
 
         def __init__(self, file_id: typing.Union[bytes, None],
-                     preloaded_audio_key: bool, audio_key_time: int):
+                        preloaded_audio_key: bool, audio_key_time: int):
             self.file_id = None if file_id is None else util.bytes_to_hex(
                 file_id)
             self.preloaded_audio_key = preloaded_audio_key
-            self.audio_key_time = audio_key_time
-            if preloaded_audio_key and audio_key_time != -1:
-                raise RuntimeError()
+            self.audio_key_time = -1 if preloaded_audio_key else audio_key_time
+
+    def __init__(self, track_or_episode: typing.Union[Metadata.Track, Metadata.Episode],
+                    input_stream: GeneralAudioStream,
+                    normalization_data: typing.Union[NormalizationData, None],
+                    file_id: str, preloaded_audio_key: bool, audio_key_time: int):
+        if type(track_or_episode) is Metadata.Track:
+            self.track = track_or_episode
+            self.episode = None
+        elif type(track_or_episode) is Metadata.Episode:
+            self.track = None
+            self.episode = track_or_episode
+        else:
+            raise TypeError()
+        self.input_stream = input_stream
+        self.normalization_data = normalization_data
+        self.metrics = self.Metrics(file_id, preloaded_audio_key, audio_key_time)
 
 
 class StreamId:
